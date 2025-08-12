@@ -146,8 +146,7 @@ REPORT_GAS=true npx hardhat test
 Known Sepolia addresses (from `deployments/sepolia` and logs):
 
 - `EcoToken`: `0x830bAEFBD1B6CC8b158B24E678B443BeE2e59603`
-- `Marketplace` proxy: `0xfd1fAB2E969aE7eC95De81caf1240107a76963Dc` (from `address.txt`)
-- Initial implementation (V1): `0x24FdDc64587398A661f885c965BaBF7079E30c21` (from `address.txt`)
+- `Marketplace` proxy: `0xfd1fAB2E969aE7eC95De81caf1240107a76963Dc`
 
 Use the existing proxy address as `MARKETPLACE_PROXY_ADDRESS` when upgrading.
 
