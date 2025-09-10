@@ -204,4 +204,154 @@ contract MarketplaceV1_1 is
     }
 
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    struct Auction {
+		address seller;
+		uint64 endTime;
+		uint256 startingBid;
+		uint256 minIncrement;
+		address highestBidder;
+		uint256 highestBid;
+		bool active;
+		bool settled;
+	}
+
+
+    mapping(uint256 => Auction) public auctions;
+
+    uint256 public totalAuctionsActive;
+
+        event AuctionCreated(
+		uint256 indexed tokenId,
+		address indexed seller,
+		uint256 startingBid,
+		uint256 minIncrement,
+		uint64 endTime
+	);
+	event BidPlaced(uint256 indexed tokenId, address indexed bidder, uint256 amount);
+	event BidRefunded(uint256 indexed tokenId, address indexed bidder, uint256 amount);
+	event AuctionCancelled(uint256 indexed tokenId, address indexed seller);
+	event AuctionSettled(
+		uint256 indexed tokenId,
+		address indexed winner,
+		address indexed seller,
+		uint256 finalPrice
+	);
+
+    function createAuction(
+		uint256 tokenId,
+		uint256 startingBid,
+		uint256 minIncrement,
+		uint64 duration
+	) external nonReentrant {
+		require(ownerOf(tokenId) == msg.sender, "Not token owner");
+		require(!listings[tokenId].active, "Already listed");
+		require(!auctions[tokenId].active, "Auction exists");
+		require(duration > 0, "Invalid duration");
+
+		_transfer(msg.sender, address(this), tokenId);
+
+		uint64 endTime = uint64(block.timestamp) + duration;
+		auctions[tokenId] = Auction({
+			seller: msg.sender,
+			endTime: endTime,
+			startingBid: startingBid,
+			minIncrement: minIncrement,
+			highestBidder: address(0),
+			highestBid: 0,
+			active: true,
+			settled: false
+		});
+		totalAuctionsActive += 1;
+
+		emit AuctionCreated(tokenId, msg.sender, startingBid, minIncrement, endTime);
+	}
+
+    function minNextBid(uint256 tokenId) public view returns (uint256) {
+		Auction memory a = auctions[tokenId];
+		require(a.active, "No auction");
+		if (a.highestBid == 0) {
+			return a.startingBid;
+		}
+		return a.highestBid + a.minIncrement;
+	}
+
+    function bid(uint256 tokenId, uint256 amount) external nonReentrant {
+		Auction storage a = auctions[tokenId];
+		require(a.active, "No auction");
+		require(block.timestamp < a.endTime, "Auction ended");
+		uint256 requiredMin = a.highestBid == 0 ? a.startingBid : a.highestBid + a.minIncrement;
+		require(amount >= requiredMin, "Bid too low");
+
+		require(paymentToken.allowance(msg.sender, address(this)) >= amount, "Insufficient allowance");
+		require(paymentToken.balanceOf(msg.sender) >= amount, "Insufficient balance");
+		paymentToken.transferFrom(msg.sender, address(this), amount);
+
+		if (a.highestBidder != address(0)) {
+			address prevBidder = a.highestBidder;
+			uint256 prevAmount = a.highestBid;
+			a.highestBidder = msg.sender;
+			a.highestBid = amount;
+			paymentToken.transfer(prevBidder, prevAmount);
+			emit BidRefunded(tokenId, prevBidder, prevAmount);
+		} else {
+			a.highestBidder = msg.sender;
+			a.highestBid = amount;
+		}
+
+		emit BidPlaced(tokenId, msg.sender, amount);
+	}
+
+    function cancelAuction(uint256 tokenId) external nonReentrant {
+		Auction memory a = auctions[tokenId];
+		require(a.active, "No auction");
+		require(a.seller == msg.sender, "Not seller");
+		require(a.highestBid == 0, "Already has bids");
+
+		delete auctions[tokenId];
+		totalAuctionsActive -= 1;
+
+		_transfer(address(this), msg.sender, tokenId);
+
+		emit AuctionCancelled(tokenId, msg.sender);
+	}
+
+    function settleAuction(uint256 tokenId) external nonReentrant {
+		Auction memory a = auctions[tokenId];
+		require(a.active, "No auction");
+		require(block.timestamp >= a.endTime, "Auction not ended");
+
+		delete auctions[tokenId];
+		totalAuctionsActive -= 1;
+
+		if (a.highestBidder == address(0)) {
+			_transfer(address(this), a.seller, tokenId);
+			emit AuctionSettled(tokenId, address(0), a.seller, 0);
+			return;
+		}
+
+		uint256 salePrice = a.highestBid;
+
+		uint256 fee = (salePrice * commissionBps) / 10_000;
+		(address royaltyReceiver, uint256 royaltyAmount) = royaltyInfo(tokenId, salePrice);
+		require(fee + royaltyAmount <= salePrice, "Fees exceed price");
+		uint256 sellerAmount = salePrice - fee - royaltyAmount;
+
+		if (royaltyAmount > 0 && royaltyReceiver != address(0)) {
+			paymentToken.transfer(royaltyReceiver, royaltyAmount);
+			emit RoyaltyPaid(tokenId, a.highestBidder, royaltyReceiver, royaltyAmount);
+		}
+
+		if (fee > 0) {
+			paymentToken.transfer(commissionRecipient, fee);
+			emit CommissionPaid(tokenId, a.highestBidder, commissionRecipient, fee);
+		}
+
+		paymentToken.transfer(a.seller, sellerAmount);
+
+		_transfer(address(this), a.highestBidder, tokenId);
+
+		emit AuctionSettled(tokenId, a.highestBidder, a.seller, salePrice);
+	}
+
+
 }

@@ -2,6 +2,7 @@ import type { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
 import "@openzeppelin/hardhat-upgrades";
 import "hardhat-deploy";
+import "hardhat-contract-sizer";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -15,6 +16,11 @@ const config: HardhatUserConfig = {
         runs: 200,
       },
     },
+  },
+  contractSizer: {
+    runOnCompile: true,
+    alphaSort: true,
+    disambiguatePaths: true,
   },
   networks: {
     hardhat: {},
