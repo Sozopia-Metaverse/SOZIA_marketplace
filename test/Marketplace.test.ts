@@ -88,7 +88,8 @@ describe("MarketplaceV1_1 and EcoToken", function () {
       const receipt = await tx.wait();
       tokenId = receipt?.logs[0].topics[3] ? BigInt(receipt.logs[0].topics[3]).toString() : "0";
 
-      await ecoToken.connect(user2).approve(marketplace.getAddress(), nftPrice);
+      // FIX: await the marketplace address
+      await ecoToken.connect(user2).approve(await marketplace.getAddress(), nftPrice);
     });
 
     it("should allow user to list NFT for sale", async function () {
@@ -169,6 +170,132 @@ describe("MarketplaceV1_1 and EcoToken", function () {
       expect(await ecoToken.balanceOf(user1.address)).to.equal(sellerBefore + sellerNet);
       expect(await ecoToken.balanceOf(owner.address)).to.equal(ownerBefore + commission);
       expect(await ecoToken.balanceOf(user3.address)).to.equal(royaltyBefore + royalty);
+    });
+  });
+
+  describe("Auctions", function () {
+    let tokenId: string;
+
+    const startingBid = ethers.parseUnits("50", 18);
+    const minIncrement = ethers.parseUnits("10", 18);
+    const duration = 60; // seconds
+
+    beforeEach(async function () {
+      const tx = await marketplace.mint(user1.address, metadataURI);
+      const receipt = await tx.wait();
+      tokenId = receipt?.logs[0].topics[3] ? BigInt(receipt.logs[0].topics[3]).toString() : "0";
+      // Default royalty 5% to user3 for auction settlement checks
+      await marketplace.setDefaultRoyalty(user3.address, 500);
+    });
+
+    it("creates an auction and locks NFT", async function () {
+      await marketplace.connect(user1).createAuction(tokenId, startingBid, minIncrement, duration);
+      const a = await marketplace.auctions(tokenId);
+      expect(a.active).to.equal(true);
+      expect(a.seller).to.equal(user1.address);
+      expect(a.startingBid).to.equal(startingBid);
+      expect(a.minIncrement).to.equal(minIncrement);
+      expect(await marketplace.ownerOf(tokenId)).to.equal(await marketplace.getAddress());
+      expect(await marketplace.minNextBid(tokenId)).to.equal(startingBid);
+    });
+
+    it("places bids and refunds previous bidder", async function () {
+      await marketplace.connect(user1).createAuction(tokenId, startingBid, minIncrement, duration);
+
+      // fund and approve user2 and user3
+      await ecoToken.transfer(user2.address, startingBid + minIncrement);
+      await ecoToken.transfer(user3.address, startingBid + 2n * minIncrement);
+      await ecoToken.connect(user2).approve(await marketplace.getAddress(), startingBid + minIncrement);
+      await ecoToken.connect(user3).approve(await marketplace.getAddress(), startingBid + 2n * minIncrement);
+
+      const u2Before = await ecoToken.balanceOf(user2.address);
+      await expect(marketplace.connect(user2).bid(tokenId, startingBid))
+        .to.emit(marketplace, "BidPlaced")
+        .withArgs(tokenId, user2.address, startingBid);
+      const u2After = await ecoToken.balanceOf(user2.address);
+      expect(u2Before - u2After).to.equal(startingBid);
+
+      // Next min bid should be startingBid + minIncrement
+      expect(await marketplace.minNextBid(tokenId)).to.equal(startingBid + minIncrement);
+
+      const u2BeforeRefund = await ecoToken.balanceOf(user2.address);
+      const u3Before = await ecoToken.balanceOf(user3.address);
+      await expect(marketplace.connect(user3).bid(tokenId, startingBid + minIncrement))
+        .to.emit(marketplace, "BidRefunded")
+        .withArgs(tokenId, user2.address, startingBid)
+        .and.to.emit(marketplace, "BidPlaced")
+        .withArgs(tokenId, user3.address, startingBid + minIncrement);
+
+      // user2 refunded
+      const u2AfterRefund = await ecoToken.balanceOf(user2.address);
+      expect(u2AfterRefund - u2BeforeRefund).to.equal(startingBid);
+
+      // user3 funds locked in contract
+      const u3After = await ecoToken.balanceOf(user3.address);
+      expect(u3Before - u3After).to.equal(startingBid + minIncrement);
+    });
+
+    it("cancels auction only by seller and only without bids", async function () {
+      await marketplace.connect(user1).createAuction(tokenId, startingBid, minIncrement, duration);
+      await expect(marketplace.connect(user2).cancelAuction(tokenId)).to.be.revertedWith("Not seller");
+
+      // place a bid, then cancel should fail
+      await ecoToken.transfer(user2.address, startingBid);
+      await ecoToken.connect(user2).approve(await marketplace.getAddress(), startingBid);
+      await marketplace.connect(user2).bid(tokenId, startingBid);
+      await expect(marketplace.connect(user1).cancelAuction(tokenId)).to.be.revertedWith("Already has bids");
+    });
+
+    it("cancels auction without bids returns NFT to seller", async function () {
+      await marketplace.connect(user1).createAuction(tokenId, startingBid, minIncrement, duration);
+      await marketplace.connect(user1).cancelAuction(tokenId);
+      expect(await marketplace.ownerOf(tokenId)).to.equal(user1.address);
+    });
+
+    it("cannot settle before end", async function () {
+      await marketplace.connect(user1).createAuction(tokenId, startingBid, minIncrement, duration);
+      await expect(marketplace.settleAuction(tokenId)).to.be.revertedWith("Auction not ended");
+    });
+
+    it("settles auction with no bids, returns NFT to seller", async function () {
+      await marketplace.connect(user1).createAuction(tokenId, startingBid, minIncrement, duration);
+      await ethers.provider.send("evm_increaseTime", [duration + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(marketplace.settleAuction(tokenId))
+        .to.emit(marketplace, "AuctionSettled")
+        .withArgs(tokenId, ethers.ZeroAddress, user1.address, 0);
+
+      expect(await marketplace.ownerOf(tokenId)).to.equal(user1.address);
+    });
+
+    it("settles auction with bids, pays royalty and commission, transfers NFT to winner", async function () {
+      await marketplace.connect(user1).createAuction(tokenId, startingBid, minIncrement, duration);
+
+      const bidAmount = startingBid + 2n * minIncrement; // make sure above min
+      await ecoToken.transfer(user2.address, bidAmount);
+      await ecoToken.connect(user2).approve(await marketplace.getAddress(), bidAmount);
+      await marketplace.connect(user2).bid(tokenId, bidAmount);
+
+      const royalty = (bidAmount * 500n) / BPS_DENOM;
+      const commission = (bidAmount * COMMISSION_BPS) / BPS_DENOM;
+      const sellerNet = bidAmount - royalty - commission;
+
+      const sellerBefore = await ecoToken.balanceOf(user1.address);
+      const royaltyBefore = await ecoToken.balanceOf(user3.address);
+      const commissionBefore = await ecoToken.balanceOf(owner.address);
+
+      await ethers.provider.send("evm_increaseTime", [duration + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(marketplace.settleAuction(tokenId))
+        .to.emit(marketplace, "AuctionSettled")
+        .withArgs(tokenId, user2.address, user1.address, bidAmount);
+
+      expect(await marketplace.ownerOf(tokenId)).to.equal(user2.address);
+      expect(await ecoToken.balanceOf(user1.address)).to.equal(sellerBefore + sellerNet);
+      expect(await ecoToken.balanceOf(user3.address)).to.equal(royaltyBefore + royalty);
+      expect(await ecoToken.balanceOf(owner.address)).to.equal(commissionBefore + commission);
     });
   });
 });
